@@ -23,9 +23,10 @@ from __future__ import annotations
 import argparse
 import csv
 import re
+import os
 from pathlib import Path
 
-SNAKE_CASE_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$")
+SNAKE_CASE_RE = re.compile(r"^_*[a-z0-9]+(?:_[a-z0-9]+)*_*$")
 
 SPEC_COLUMNS = [
     "Input Shapes",
@@ -52,6 +53,13 @@ RESULT_COLUMNS = [
 ]
 
 SEPARATOR = "-" * 78
+CONTEXT = []
+
+def my_print(string):
+    global CONTEXT
+    print(string)
+    CONTEXT += [string]
+
 
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
@@ -125,9 +133,9 @@ def _select_closest_duration_row(
 
 
 def _print_section(title: str, row: dict[str, str], columns: list[str]) -> None:
-    print(f"{title}:")
+    my_print(f"{title}:")
     for column in columns:
-        print(f"  - {column}: {row.get(column, '')}")
+        my_print(f"  - {column}: {row.get(column, '')}")
 
 
 def _print_kernel_result(
@@ -138,13 +146,13 @@ def _print_kernel_result(
     detail_row: dict[str, str],
     show_source: bool,
 ) -> None:
-    print(SEPARATOR)
-    print(f"kernel: {kernel_name}")
+    my_print(SEPARATOR)
+    my_print(f"kernel: {kernel_name}")
     if show_source:
-        print(f"run: {run_name}")
-        print(f"op_type: {op_type}")
-        print(f"avg_time(us): {avg_time_us}")
-        print(f"matched_duration(us): {detail_row.get('Duration(us)', '')}")
+        my_print(f"run: {run_name}")
+        my_print(f"op_type: {op_type}")
+        my_print(f"avg_time(us): {avg_time_us}")
+        my_print(f"matched_duration(us): {detail_row.get('Duration(us)', '')}")
     _print_section("Specs", detail_row, SPEC_COLUMNS)
     _print_section("Result", detail_row, RESULT_COLUMNS)
 
@@ -209,6 +217,12 @@ def main() -> None:
         action="store_true",
         help="Also print run directory, OP Type, Avg Time and matched Duration.",
     )
+    parser.add_argument(
+        "--output-file-name",
+        type=str,
+        default="output.csv",
+        help="Set output file name.",
+    )
     args = parser.parse_args()
 
     root = args.root.expanduser().resolve()
@@ -231,9 +245,53 @@ def main() -> None:
         )
 
     if total:
-        print(SEPARATOR)
+        my_print(SEPARATOR)
+        if args.show_source:
+            parse_log_to_csv(CONTEXT, args.output_file_name)
     else:
         raise SystemExit("No snake_case OP Type rows matched kernel_details rows.")
+
+
+def parse_log_to_csv(context_list, output_file):
+    file_path = Path(output_file)
+    if file_path.exists():
+        file_path.unlink()
+    headers = [
+        "op_type", "avg_time(us)", "Input Shapes", "Input Data Types", "Input Formats",
+        "Output Shapes", "Output Data Types", "Output Formats", "aiv_time(us)",
+        "aiv_vec_ratio", "aiv_scalar_ratio", "aiv_mte2_ratio", "aiv_mte3_ratio",
+        "aicore_time(us)", "aic_mac_ratio", "aic_scalar_ratio", "aic_mte1_ratio",
+        "aic_mte2_ratio", "aic_mte3_ratio", "aic_fixpipe_ratio"
+    ]
+    data_rows = []
+    current_row = {}
+    last_key = None
+    key_pattern = re.compile(r'^\s*(?:-\s+)?([\w\(\)\s/]+):\s*(.*)')
+    for line in context_list:
+        line_str = line.strip()
+        if re.match(r'-{10,}', line_str):
+            if current_row:
+                data_rows.append([current_row.get(h, "N/A") for h in headers])
+                current_row = {}
+                last_key = None
+            continue
+        if not line_str:
+            continue
+        match = key_pattern.match(line_str)
+        if match:
+            k = match.group(1).strip()
+            v = match.group(2).strip().strip('"')
+            current_row[k] = v
+            last_key = k
+        else:
+            if last_key:
+                current_row[last_key] = (current_row[last_key] + " " + line_str).strip()
+    if current_row:
+        data_rows.append([current_row.get(h, "N/A") for h in headers])
+    with open(output_file, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        writer.writerows(data_rows)
 
 
 if __name__ == "__main__":

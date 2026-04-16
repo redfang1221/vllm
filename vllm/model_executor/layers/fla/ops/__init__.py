@@ -7,12 +7,19 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 from .chunk import chunk_gated_delta_rule
-from .fused_gdn_prefill_post_conv import fused_post_conv_prep
+from .fused_gdn_prefill_post_conv import (
+    fused_post_conv_prep,
+    _fused_post_conv_kernel
+)
 from .fused_recurrent import (
     fused_recurrent_gated_delta_rule,
     fused_recurrent_gated_delta_rule_packed_decode,
+    fused_recurrent_gated_delta_rule_packed_decode_kernel
 )
-from .fused_sigmoid_gating import fused_sigmoid_gating_delta_rule_update
+from .fused_sigmoid_gating import (
+    fused_sigmoid_gating_delta_rule_update,
+    fused_sigmoid_gating_delta_rule_update_kernel
+)
 from .layernorm_guard import RMSNormGated
 
 __all__ = [
@@ -20,6 +27,9 @@ __all__ = [
     "chunk_gated_delta_rule",
     "fused_recurrent_gated_delta_rule",
     "fused_recurrent_gated_delta_rule_packed_decode",
+    "fused_recurrent_gated_delta_rule_packed_decode_kernel",
     "fused_post_conv_prep",
+    "_fused_post_conv_kernel",
     "fused_sigmoid_gating_delta_rule_update",
+    "fused_sigmoid_gating_delta_rule_update_kernel",
 ]

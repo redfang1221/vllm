@@ -15,9 +15,12 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+import torch_npu
+import triton
 
 from vllm.model_executor.layers.fla.ops import (
     fused_sigmoid_gating_delta_rule_update,
+    fused_sigmoid_gating_delta_rule_update_kernel
 )
 from vllm.triton_utils import triton
 
@@ -60,7 +63,7 @@ def perf_test(func: Callable[[], None]) -> float:
 
 def build_data(spec: SigmoidGatingSpec) -> dict[str, object]:
     torch.manual_seed(0)
-    device = torch.device("cuda")
+    device = torch.device("npu")
     seq_len = spec.num_speculative_tokens + 1
     num_tokens = spec.num_reqs * seq_len
     total_entries = num_tokens + 1
@@ -138,21 +141,111 @@ def build_data(spec: SigmoidGatingSpec) -> dict[str, object]:
     }
 
 
-def run_performance(spec: SigmoidGatingSpec) -> float:
+def get_input_args(data):
+    beta: float = 1.0
+    threshold: float = 20.0
+    scale: float = None
+    initial_state: torch.Tensor = None
+    inplace_final_state: bool = True
+    cu_seqlens: torch.Tensor | None = None
+    ssm_state_indices: torch.Tensor | None = None
+    num_accepted_tokens: torch.Tensor | None = None
+    use_qk_l2norm_in_kernel: bool = False
+    is_kda: bool = False
+    A_log = data["A_log"]
+    a = data["a"]
+    b = data["b"]
+    dt_bias = data["dt_bias"]
+    q = data["q"]
+    k = data["k"]
+    v = data["v"]
+    initial_state = data["initial_state"]
+    inplace_final_state = data["inplace_final_state"]
+    cu_seqlens = data["cu_seqlens"]
+    ssm_state_indices = data["ssm_state_indices"]
+    num_accepted_tokens = data["num_accepted_tokens"]
+    use_qk_l2norm_in_kernel = data["use_qk_l2norm_in_kernel"]
+
+    B, T, H, K, V = *k.shape, v.shape[-1]
+    HV = v.shape[2]
+    N = B if cu_seqlens is None else len(cu_seqlens) - 1
+    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
+    assert NK == 1, "NK > 1 is not supported yet"
+    num_stages = 3
+    num_warps = 4
+
+    if cu_seqlens is not None and q.shape[0] != 1:
+        raise ValueError(
+            f"The batch size is expected to be 1 rather than {q.shape[0]}"
+            f" when using `cu_seqlens`. Please flatten variable-length"
+            f" inputs before processing."
+        )
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+    else:
+        assert scale > 0, "scale must be positive"
+
+    o = q.new_empty(NK, *v.shape)
+    if inplace_final_state:
+        final_state = initial_state
+    else:
+        final_state = q.new_empty(T, HV, V, K, dtype=initial_state.dtype)
+
+    stride_init_state_token = initial_state.stride(0)
+    stride_final_state_token = final_state.stride(0)
+
+    if ssm_state_indices is None:
+        stride_indices_seq, stride_indices_tok = 1, 1
+    elif ssm_state_indices.ndim == 1:
+        stride_indices_seq, stride_indices_tok = ssm_state_indices.stride(0), 1
+    else:
+        stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
+
+    grid = (NK, NV, N * HV)
+    return {"grid": grid, "input_data": {
+        "A_log": A_log, "a": a.contiguous(), "b": b.contiguous(), "dt_bias": dt_bias, "beta": beta, "threshold": threshold, "q": q.contiguous(), "k": k.contiguous(), "v": v.contiguous(), "o": o, "h0": initial_state, "ht": final_state, "cu_seqlens": cu_seqlens, "ssm_state_indices": ssm_state_indices, "num_accepted_tokens": num_accepted_tokens, "scale": scale, "N": N, "T": T, "B": B, "H": H, "HV": HV, "K": K, "V": V, "BK": BK, "BV": BV, "stride_init_state_token": stride_init_state_token, "stride_final_state_token": stride_final_state_token, "stride_indices_seq": stride_indices_seq, "stride_indices_tok": stride_indices_tok, "INPLACE_FINAL_STATE": inplace_final_state, "USE_QK_L2NORM_IN_KERNEL": use_qk_l2norm_in_kernel, "IS_KDA": is_kda, "num_warps": num_warps, "num_stages": num_stages
+    }}
+
+
+def perf_test(fn_triton, args, save_path="./result_dir"):
+    experimental_config = torch_npu.profiler._ExperimentalConfig(
+            aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+            profiler_level=torch_npu.profiler.ProfilerLevel.Level1, l2_cache=False
+        )
+    with torch_npu.profiler.profile(
+            activities=[
+                torch_npu.profiler.ProfilerActivity.NPU],
+            with_stack=False,
+            record_shapes=False,
+            profile_memory=False,
+            schedule=torch_npu.profiler.schedule(wait=1,
+                                                warmup=1,
+                                                active=30,
+                                                repeat=1,
+                                                skip_first=1),
+            experimental_config=experimental_config,
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(save_path)
+    ) as prof:
+        for i in range(30):
+            fn_triton(**args)
+            torch.npu.synchronize()
+            prof.step()
+
+
+def fn_triton(grid, input_data):
+    fused_sigmoid_gating_delta_rule_update_kernel[grid](**input_data)
+
+
+def run_performance(spec: CausalConv1dUpdateSpec) -> float:
     data = build_data(spec)
-
-    def func() -> None:
-        fused_sigmoid_gating_delta_rule_update(**data)
-
-    return perf_test(func)
+    args = get_input_args(data)
+    return perf_test(fn_triton, args, "fused_sigmoid_gating_delta_rule_update_kernel_perf")
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA device")
+@pytest.mark.skipif(not torch.npu.is_available(), reason="Need NPU device")
 @pytest.mark.parametrize("spec", SPECS, ids=[spec.name for spec in SPECS])
 def test_fused_sigmoid_gating_delta_rule_update_kernel_perf(
     spec: SigmoidGatingSpec,
 ) -> None:
-    ms = run_performance(spec)
-    us = float(ms) * 1000
-    print(f"fused_sigmoid_gating_delta_rule_update_kernel[{spec.name}]: "
-          f"{us:.3f} us")
+    run_performance(spec)

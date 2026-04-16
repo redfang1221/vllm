@@ -15,9 +15,12 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+import torch_npu
+import triton
 
 from vllm.model_executor.layers.fla.ops.fused_gdn_prefill_post_conv import (
     fused_post_conv_prep,
+    _fused_post_conv_kernel
 )
 from vllm.triton_utils import triton
 
@@ -64,18 +67,18 @@ def build_data(spec: FusedPostConvSpec) -> dict[str, object]:
                spec.num_v_heads * spec.head_v_dim)
     conv_output = torch.randn(spec.length,
                               qkv_dim,
-                              device="cuda",
+                              device="npu",
                               dtype=spec.dtype)
     a = torch.randn(spec.length,
                     spec.num_v_heads,
-                    device="cuda",
+                    device="npu",
                     dtype=spec.dtype)
     b = torch.randn_like(a)
     A_log = torch.randn(spec.num_v_heads,
-                        device="cuda",
+                        device="npu",
                         dtype=torch.float32) - 2.0
     dt_bias = torch.randn(spec.num_v_heads,
-                          device="cuda",
+                          device="npu",
                           dtype=torch.float32) * 0.1
     return {
         "conv_output": conv_output,
@@ -91,18 +94,90 @@ def build_data(spec: FusedPostConvSpec) -> dict[str, object]:
     }
 
 
-def run_performance(spec: FusedPostConvSpec) -> float:
+def get_input_args(data):
+    apply_l2norm: bool = True
+    output_g_exp: bool = False
+    conv_output = data["conv_output"]
+    a = data["a"]
+    b = data["b"]
+    A_log = data["A_log"]
+    dt_bias = data["dt_bias"]
+    num_k_heads = data["num_k_heads"]
+    head_k_dim = data["head_k_dim"]
+    head_v_dim = data["head_v_dim"]
+    apply_l2norm = data["apply_l2norm"]
+    output_g_exp = data["output_g_exp"]
+    L = conv_output.shape[0]
+    qkv_dim = conv_output.shape[1]
+    H = num_k_heads
+    K = head_k_dim
+    V = head_v_dim
+    HV = A_log.shape[0]
+    dtype = conv_output.dtype
+    device = conv_output.device
+
+    assert qkv_dim == 2 * H * K + HV * V, (
+        f"qkv_dim={qkv_dim} != 2*H*K + HV*V = {2 * H * K + HV * V}"
+    )
+
+    # Allocate outputs in target contiguous layout
+    q = torch.empty(L, H, K, dtype=dtype, device=device)
+    k = torch.empty(L, H, K, dtype=dtype, device=device)
+    v = torch.empty(L, HV, V, dtype=dtype, device=device)
+    g = torch.empty(L, HV, dtype=torch.float32, device=device)
+    beta = torch.empty(L, HV, dtype=torch.float32, device=device)
+
+    if L == 0:
+        return q, k, v, g, beta
+
+    # ---- Kernel config ----
+    BK = triton.next_power_of_2(K)
+    BV = triton.next_power_of_2(V)
+    BLOCK_T = 16  # tokens per block
+
+    # Single kernel: blocks [0,H) do Q/K, blocks [H, H+HV) do V+gating
+    grid = (triton.cdiv(L, BLOCK_T), H + HV)
+    return {"grid": grid, "input_data": {
+        "mixed_qkv_ptr": conv_output, "a_ptr": a, "b_ptr": b, "A_log_ptr": A_log, "dt_bias_ptr": dt_bias, "q_ptr": q, "k_ptr": k, "v_ptr": v, "g_ptr": g, "beta_ptr": beta, "stride_x_tok": conv_output.stride(0), "stride_a_tok": a.stride(0), "stride_b_tok": b.stride(0), "stride_q_tok": q.stride(0), "stride_k_tok": k.stride(0), "stride_v_tok": v.stride(0), "L": L, "H": H, "HV": HV, "K": K, "V": V, "APPLY_L2NORM": apply_l2norm, "L2NORM_EPS": 1e-6, "OUTPUT_G_EXP": output_g_exp, "SOFTPLUS_THRESHOLD": 20.0, "BLOCK_T": BLOCK_T, "BK": BK, "BV": BV, "num_warps": 4, "num_stages": 2
+    }}
+
+
+def perf_test(fn_triton, args, save_path="./result_dir"):
+    experimental_config = torch_npu.profiler._ExperimentalConfig(
+            aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+            profiler_level=torch_npu.profiler.ProfilerLevel.Level1, l2_cache=False
+        )
+    with torch_npu.profiler.profile(
+            activities=[
+                torch_npu.profiler.ProfilerActivity.NPU],
+            with_stack=False,
+            record_shapes=False,
+            profile_memory=False,
+            schedule=torch_npu.profiler.schedule(wait=1,
+                                                warmup=1,
+                                                active=30,
+                                                repeat=1,
+                                                skip_first=1),
+            experimental_config=experimental_config,
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(save_path)
+    ) as prof:
+        for i in range(30):
+            fn_triton(**args)
+            torch.npu.synchronize()
+            prof.step()
+
+
+def fn_triton(grid, input_data):
+    _fused_post_conv_kernel[grid](**input_data)
+
+
+def run_performance(spec: CausalConv1dUpdateSpec) -> float:
     data = build_data(spec)
-
-    def func() -> None:
-        fused_post_conv_prep(**data)
-
-    return perf_test(func)
+    args = get_input_args(data)
+    return perf_test(fn_triton, args, "fused_post_conv_kernel_perf")
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA device")
+@pytest.mark.skipif(not torch.npu.is_available(), reason="Need NPU device")
 @pytest.mark.parametrize("spec", SPECS, ids=[spec.name for spec in SPECS])
 def test_fused_post_conv_kernel_perf(spec: FusedPostConvSpec) -> None:
-    ms = run_performance(spec)
-    us = float(ms) * 1000
-    print(f"_fused_post_conv_kernel[{spec.name}]: {us:.3f} us")
+    run_performance(spec)

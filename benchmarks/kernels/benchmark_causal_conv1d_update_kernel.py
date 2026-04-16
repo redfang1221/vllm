@@ -14,9 +14,11 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+import torch_npu
+import triton
 
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
-    causal_conv1d_update,
+    causal_conv1d_update, _causal_conv1d_update_kernel
 )
 from vllm.triton_utils import triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -64,8 +66,33 @@ def perf_test(func: Callable[[], None]) -> float:
     return triton.testing.do_bench(func, warmup=warmup, rep=rep)
 
 
+def perf_test(fn_triton, args, save_path="./result_dir"):
+    experimental_config = torch_npu.profiler._ExperimentalConfig(
+            aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+            profiler_level=torch_npu.profiler.ProfilerLevel.Level1, l2_cache=False
+        )
+    with torch_npu.profiler.profile(
+            activities=[
+                torch_npu.profiler.ProfilerActivity.NPU],
+            with_stack=False,
+            record_shapes=False,
+            profile_memory=False,
+            schedule=torch_npu.profiler.schedule(wait=1,
+                                                warmup=1,
+                                                active=30,
+                                                repeat=1,
+                                                skip_first=1),
+            experimental_config=experimental_config,
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(save_path)
+    ) as prof:
+        for i in range(30):
+            fn_triton(**args)
+            torch.npu.synchronize()
+            prof.step()
+
+
 def _randn(*shape: int, dtype: torch.dtype) -> torch.Tensor:
-    return torch.randn(*shape, device="cuda", dtype=dtype)
+    return torch.randn(*shape, device="npu", dtype=dtype)
 
 
 def build_data(spec: CausalConv1dUpdateSpec) -> dict[str, object]:
@@ -89,7 +116,7 @@ def build_data(spec: CausalConv1dUpdateSpec) -> dict[str, object]:
         x = _randn(spec.batch, spec.dim, dtype=spec.dtype)
         indices = torch.arange(1,
                                spec.batch + 1,
-                               device="cuda",
+                               device="npu",
                                dtype=torch.int32)
         return {
             "x": x,
@@ -107,19 +134,19 @@ def build_data(spec: CausalConv1dUpdateSpec) -> dict[str, object]:
         state_indices = torch.arange(
             1,
             spec.batch * tokens_per_req + 1,
-            device="cuda",
+            device="npu",
             dtype=torch.int32,
         ).view(spec.batch, tokens_per_req)
         query_start_loc = torch.arange(
             0,
             total_tokens + 1,
             tokens_per_req,
-            device="cuda",
+            device="npu",
             dtype=torch.int32,
         )
         num_accepted_tokens = torch.full((spec.batch,),
                                          tokens_per_req,
-                                         device="cuda",
+                                         device="npu",
                                          dtype=torch.int32)
         return {
             "x": x,
@@ -139,12 +166,12 @@ def build_data(spec: CausalConv1dUpdateSpec) -> dict[str, object]:
                dtype=spec.dtype).transpose(1, 2)
     valid_indices = torch.arange(1,
                                  spec.batch + 1,
-                                 device="cuda",
+                                 device="npu",
                                  dtype=torch.int32)
     if padding:
         pad = torch.full((padding,),
                          NULL_BLOCK_ID,
-                         device="cuda",
+                         device="npu",
                          dtype=torch.int32)
         indices = torch.cat([valid_indices, pad])
     else:
@@ -159,22 +186,145 @@ def build_data(spec: CausalConv1dUpdateSpec) -> dict[str, object]:
     }
 
 
+def get_input_args(data):
+    bias: torch.Tensor | None = None
+    activation: bool | str | None = None
+    conv_state_indices: torch.Tensor | None = None
+    num_accepted_tokens: torch.Tensor | None = None
+    query_start_loc: torch.Tensor | None = None
+    max_query_len: int = -1
+    null_block_id: int = NULL_BLOCK_ID
+    block_idx_last_scheduled_token: torch.Tensor | None = None
+    initial_state_idx: torch.Tensor | None = None
+    validate_data=False
+
+    x = data["x"]
+    conv_state = data["conv_state"]
+    weight = data["weight"]
+    bias = data["bias"]
+    activation = data["activation"]
+    conv_state_indices = data["conv_state_indices"]
+    if "num_accepted_tokens" in data.keys():
+        num_accepted_tokens = data["num_accepted_tokens"]
+    if "query_start_loc" in data.keys():
+        query_start_loc = data["query_start_loc"]
+    if "max_query_len" in data.keys():
+        max_query_len = data["max_query_len"]
+
+    causal_conv1d_update(**data)
+    if validate_data:
+        assert null_block_id is not None
+        assert x.stride(1) == 1
+    if isinstance(activation, bool):
+        activation = "silu" if activation is True else None
+    elif activation is not None:
+        assert activation in ["silu", "swish"]
+
+    original_x_dtype = x.dtype
+    x = x.to(conv_state.dtype)
+    unsqueeze = query_start_loc is None and x.dim() == 2
+    if unsqueeze:
+        # make it (batch, dim, seqlen) with seqlen == 1
+        x = x.unsqueeze(-1)
+    if query_start_loc is None:
+        batch, dim, seqlen = x.shape
+    else:
+        assert conv_state_indices is not None
+        batch = conv_state_indices.size(0)
+        dim = x.size(1)
+        seqlen = max_query_len
+    _, width = weight.shape
+    # conv_state: (..., dim, state_len), where state_len >= width - 1
+    num_cache_lines, _, state_len = conv_state.size()
+
+    if validate_data:
+        assert dim == weight.size(0)
+        assert state_len >= width - 1
+        # when above happens, we don't shift-left to keep any records in conv_state
+        assert dim == conv_state.size(1)
+        if conv_state_indices is None:
+            assert conv_state.size(0) >= batch
+        else:
+            assert batch == conv_state_indices.shape[0], (
+                f"ERROR: conv_state_indices should have shape ({batch},*) but got {conv_state_indices.shape}"
+            )
+
+        assert num_cache_lines >= batch
+        assert weight.stride(1) == 1  # Need this
+
+    # adopt the strategy in vLLM that overwrite on 'x' directly, rather than creating a new tensor 'o'
+    out = x
+    stride_w_dim, stride_w_width = weight.stride()
+
+    if query_start_loc is None:
+        # X (batch, dim, seqlen)
+        stride_x_seq, stride_x_dim, stride_x_token = x.stride()
+        stride_o_seq, stride_o_dim, stride_o_token = out.stride()
+    else:
+        # X (dim, cu_seqlen)
+        stride_x_token, stride_x_dim = x.stride()
+        stride_x_seq = 0
+        stride_o_token, stride_o_dim = out.stride()
+        stride_o_seq = 0
+
+    stride_istate_seq, stride_istate_dim, stride_istate_token = conv_state.stride()
+    stride_state_indices = (
+        conv_state_indices.stride(0) if conv_state_indices is not None else 0
+    )
+    if num_accepted_tokens is not None:
+        state_len = width - 1 + (seqlen - 1)  # effective state_len needed
+    else:
+        state_len = width - 1
+    np2_statelen = triton.next_power_of_2(state_len)
+
+    def grid(META):
+        return (
+            batch,
+            triton.cdiv(dim, META["BLOCK_N"]),
+        )
+    return {"grid": grid, "input_data": {
+        "x_ptr": x, "w_ptr": weight, "bias_ptr": bias, "conv_state_ptr": conv_state, "conv_state_indices_ptr": conv_state_indices, "num_accepted_tokens_ptr": num_accepted_tokens, "query_start_loc_ptr": query_start_loc, "block_idx_last_scheduled_token": block_idx_last_scheduled_token, "initial_state_idx": initial_state_idx, "o_ptr": out, "batch": batch, "dim": dim, "seqlen": seqlen, "state_len": state_len, "num_cache_lines": num_cache_lines, "stride_x_seq": stride_x_seq, "stride_x_dim": stride_x_dim, "stride_x_token": stride_x_token, "stride_w_dim": stride_w_dim, "stride_w_width": stride_w_width, "stride_conv_state_seq": stride_istate_seq, "stride_conv_state_dim": stride_istate_dim, "stride_conv_state_tok": stride_istate_token, "stride_state_indices": stride_state_indices, "stride_o_seq": stride_o_seq, "stride_o_dim": stride_o_dim, "stride_o_token": stride_o_token, "null_block_id": null_block_id, "HAS_BIAS": bias is not None, "KERNEL_WIDTH": width, "SILU_ACTIVATION": activation in ["silu" "swish"], "IS_VARLEN": query_start_loc is not None, "IS_APC_ENABLED": block_idx_last_scheduled_token is not None, "IS_SPEC_DECODING": num_accepted_tokens is not None, "NP2_STATELEN": np2_statelen, "HAS_NULL_BLOCK": null_block_id is not None, "BLOCK_N": 256
+    }}
+
+
+def perf_test(fn_triton, args, save_path="./result_dir"):
+    experimental_config = torch_npu.profiler._ExperimentalConfig(
+            aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+            profiler_level=torch_npu.profiler.ProfilerLevel.Level1, l2_cache=False
+        )
+    with torch_npu.profiler.profile(
+            activities=[
+                torch_npu.profiler.ProfilerActivity.NPU],
+            with_stack=False,
+            record_shapes=False,
+            profile_memory=False,
+            schedule=torch_npu.profiler.schedule(wait=1,
+                                                warmup=1,
+                                                active=30,
+                                                repeat=1,
+                                                skip_first=1),
+            experimental_config=experimental_config,
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(save_path)
+    ) as prof:
+        for i in range(30):
+            fn_triton(**args)
+            torch.npu.synchronize()
+            prof.step()
+
+
+def fn_triton(grid, input_data):
+    _causal_conv1d_update_kernel[grid](**input_data)
+
+
 def run_performance(spec: CausalConv1dUpdateSpec) -> float:
     data = build_data(spec)
-    # if you need to print detail info about generated data
-    # for key, value in data.items():
-    #     print(key, ": ", f"{value.shape}, {value.dtype}" if isinstance(value, torch.Tensor) else value)
-    def func() -> None:
-        causal_conv1d_update(**data)
-
-    return perf_test(func)
+    args = get_input_args(data)
+    return perf_test(fn_triton, args, "causal_conv1d_update_kernel_perf")
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA device")
+@pytest.mark.skipif(not torch.npu.is_available(), reason="Need NPU device")
 @pytest.mark.parametrize("spec", SPECS, ids=[spec.name for spec in SPECS])
 def test_causal_conv1d_update_kernel_perf(
     spec: CausalConv1dUpdateSpec,
 ) -> None:
-    ms = run_performance(spec)
-    us = float(ms) * 1000
-    print(f"_causal_conv1d_update_kernel[{spec.name}]: {us:.3f} us")
+    run_performance(spec)
