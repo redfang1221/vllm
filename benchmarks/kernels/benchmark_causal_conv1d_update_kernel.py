@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 import torch
@@ -22,6 +23,8 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
 )
 from vllm.triton_utils import triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
+DUMP_NAME = "_causal_conv1d_update"
 
 
 @dataclass(frozen=True)
@@ -64,6 +67,15 @@ def perf_test(func: Callable[[], None]) -> float:
     warmup = int(os.getenv("VLLM_KERNEL_BENCH_WARMUP", "25"))
     rep = int(os.getenv("VLLM_KERNEL_BENCH_REP", "100"))
     return triton.testing.do_bench(func, warmup=warmup, rep=rep)
+
+
+def configure_triton_dump(spec_name: str) -> None:
+    os.environ["TRITON_ALWAYS_COMPILE"] = "1"
+    os.environ["TRITON_DEBUG"] = "1"
+    os.environ["TRITON_KERNEL_DUMP"] = "1"
+    dump_dir = f"./{DUMP_NAME}_{spec_name}_cache"
+    Path(dump_dir).mkdir(parents=True, exist_ok=True)
+    os.environ["TRITON_DUMP_DIR"] = dump_dir
 
 
 def perf_test(fn_triton, args, save_path="./result_dir"):
@@ -317,6 +329,7 @@ def fn_triton(grid, input_data):
 
 
 def run_performance(spec: CausalConv1dUpdateSpec) -> float:
+    configure_triton_dump(spec.name)
     data = build_data(spec)
     args = get_input_args(data)
     return perf_test(fn_triton, args, "causal_conv1d_update_kernel_perf")
